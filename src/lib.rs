@@ -23,6 +23,7 @@ pub mod payoff;
 pub mod positions;
 pub mod prices;
 pub mod rate_limit_key;
+pub mod readmodels;
 pub mod request_id;
 pub mod strategies;
 pub mod strkey;
@@ -528,6 +529,7 @@ pub async fn init_state() -> AppState {
     tokio::spawn(auth::cleanup_expired_loop(state.db.clone()));
     tokio::spawn(alerts::check_alerts_loop(state.clone()));
     tokio::spawn(prices::price_simulator_loop(state.clone()));
+    tokio::spawn(readmodels::check_consistency_loop(state.db.clone()));
     state
 }
 

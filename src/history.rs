@@ -6,6 +6,7 @@ use crate::auth::AuthUser;
 use crate::error::{db_error, AppError, AppQuery};
 use crate::models::Position;
 use crate::positions::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
+use crate::readmodels::wallet_position_counts;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -65,27 +66,33 @@ pub async fn get_history(
     .await
     .map_err(|e| db_error("load trade history", e))?;
 
-    let (trade_count, win_count, loss_count, total_realized_pnl): (i64, i64, i64, Option<f64>) =
-        sqlx::query_as(
-            "SELECT
-                COUNT(*),
-                COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END), 0),
-                SUM(realized_pnl)
-             FROM positions
-             WHERE wallet_address = ? AND status IN ('closed', 'rolled')",
-        )
-        .bind(&wallet_address)
-        .fetch_one(&state.db)
+    // Stats come from the wallet_position_counts read model — a single
+    // row per wallet, maintained in the same transaction as each settle —
+    // so they're O(1) instead of aggregating the full history per request.
+    // A wallet that has never settled a position has no row yet, which
+    // reads as all-zero stats.
+    let counts = wallet_position_counts(&state.db, &wallet_address)
         .await
-        .map_err(|e| db_error("compute trade history stats", e))?;
+        .map_err(|e| db_error("load trade history stats", e))?;
 
-    let has_more = offset + (trades.len() as i64) < trade_count;
-    let stats = HistoryStats {
-        trade_count,
-        win_count,
-        loss_count,
-        total_realized_pnl: total_realized_pnl.unwrap_or(0.0),
+    let has_more = offset + (trades.len() as i64)
+        < counts
+            .as_ref()
+            .map(|c| c.trade_count)
+            .unwrap_or(0);
+    let stats = match counts {
+        Some(c) => HistoryStats {
+            trade_count: c.trade_count,
+            win_count: c.win_count,
+            loss_count: c.loss_count,
+            total_realized_pnl: c.total_realized_pnl,
+        },
+        None => HistoryStats {
+            trade_count: 0,
+            win_count: 0,
+            loss_count: 0,
+            total_realized_pnl: 0.0,
+        },
     };
 
     Ok(Json(HistoryResponse {

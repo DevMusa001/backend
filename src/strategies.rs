@@ -10,6 +10,7 @@ use crate::models::Position;
 use crate::positions::{
     close_position_in_tx, current_bs_result, open_position_in_tx, OpenPositionRequest,
 };
+use crate::readmodels::strategy_summaries_for_wallet;
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -119,36 +120,54 @@ fn summarize(state: &AppState, strategy_id: String, legs: &[Position]) -> Strate
 /// across all of its legs. Plain single-leg positions (strategy_id NULL)
 /// aren't strategies and don't show up here — see /api/v1/positions for
 /// those.
+///
+/// Realized aggregates (leg counts, realized P&L, status) come from the
+/// strategy_summaries read model — one row per strategy, maintained in the
+/// same transaction as each leg's open/close — so this is O(strategies)
+/// rather than scanning every leg. Unrealized P&L is still computed live,
+/// but only over the wallet's currently-open legs.
 pub async fn list_strategies(
     State(state): State<AppState>,
     AuthUser(wallet_address): AuthUser,
 ) -> Result<Json<Vec<StrategySummary>>, AppError> {
-    let positions: Vec<Position> = sqlx::query_as(
+    let rows = strategy_summaries_for_wallet(&state.db, &wallet_address)
+        .await
+        .map_err(|e| db_error("list strategies", e))?;
+    // Unrealized P&L is still computed live, but only over the wallet's
+    // currently-open legs — closed legs contribute nothing to it, so they
+    // don't need to be loaded at all.
+    let open_legs: Vec<Position> = sqlx::query_as(
         "SELECT * FROM positions
-            WHERE wallet_address = ? AND strategy_id IS NOT NULL
+            WHERE wallet_address = ? AND strategy_id IS NOT NULL AND status = 'open'
          ORDER BY opened_at ASC",
     )
     .bind(&wallet_address)
     .fetch_all(&state.db)
     .await
-    .map_err(|e| db_error("list strategies", e))?;
+    .map_err(|e| db_error("load open strategy legs for unrealized pnl", e))?;
 
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<Position>> = HashMap::new();
-    for p in positions {
-        let strategy_id = p.strategy_id.clone().expect("filtered to NOT NULL above");
-        if !groups.contains_key(&strategy_id) {
-            order.push(strategy_id.clone());
+    let mut unrealized_by_strategy: HashMap<String, f64> = HashMap::new();
+    for p in &open_legs {
+        if let Some(strategy_id) = &p.strategy_id {
+            *unrealized_by_strategy
+                .entry(strategy_id.clone())
+                .or_default() += leg_unrealized_pnl(&state, p);
         }
-        groups.entry(strategy_id).or_default().push(p);
     }
 
-    let summaries = order
+    let summaries = rows
         .into_iter()
-        .rev() // ascending opened_at order in -> newest strategy first out
-        .map(|strategy_id| {
-            let legs = groups.remove(&strategy_id).expect("just inserted above");
-            summarize(&state, strategy_id, &legs)
+        .map(|row| StrategySummary {
+            strategy_id: row.strategy_id.clone(),
+            underlying: row.underlying,
+            leg_count: row.leg_count as usize,
+            open_leg_count: row.open_leg_count as usize,
+            status: row.status,
+            opened_at: row.opened_at,
+            realized_pnl: row.realized_pnl,
+            unrealized_pnl: unrealized_by_strategy
+                .remove(&row.strategy_id)
+                .unwrap_or(0.0),
         })
         .collect();
 

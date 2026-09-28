@@ -7,6 +7,10 @@ edition = "2021"
 name = "zenith-backend"
 path = "src/main.rs"
 
+[[bin]]
+name = "zenith-admin"
+path = "src/admin.rs"
+
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }

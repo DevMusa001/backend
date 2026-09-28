@@ -8,6 +8,7 @@ use crate::auth::AuthUser;
 use crate::collateral::collateral_required;
 use crate::error::{db_error, AppError, AppJson, AppQuery};
 use crate::models::{Account, Position};
+use crate::readmodels::{apply_position_closed, apply_position_opened};
 use crate::{black_scholes, smile_vol, AppState, BSInputs, BSResult};
 
 pub async fn get_account(
@@ -246,6 +247,13 @@ pub(crate) async fn open_position_in_tx(
         .await
         .map_err(|e| db_error("load the position just opened", e))?;
 
+    // Read-model maintenance runs inside the same transaction as the
+    // insert, so the CQRS summaries can never miss an open (or record one
+    // that later rolls back).
+    apply_position_opened(&mut **tx, &position)
+        .await
+        .map_err(|e| db_error("update strategy read model after open", e))?;
+
     Ok(position)
 }
 
@@ -371,6 +379,12 @@ pub(crate) async fn close_position_in_tx(
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| db_error("load the position just closed", e))?;
+
+    // Same transaction as the status update: the realized P&L and trade
+    // counts land in the read models atomically with the close itself.
+    apply_position_closed(&mut **tx, &closed)
+        .await
+        .map_err(|e| db_error("update position read models after close", e))?;
 
     Ok(closed)
 }
