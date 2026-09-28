@@ -8,6 +8,7 @@ use crate::auth::AuthUser;
 use crate::collateral::collateral_required;
 use crate::error::{db_error, AppError, AppJson, AppQuery};
 use crate::models::{Account, Position};
+use crate::outbox::{self, DomainEvent};
 use crate::readmodels::{apply_position_closed, apply_position_opened};
 use crate::{black_scholes, smile_vol, AppState, BSInputs, BSResult};
 
@@ -254,6 +255,12 @@ pub(crate) async fn open_position_in_tx(
         .await
         .map_err(|e| db_error("update strategy read model after open", e))?;
 
+    // The domain event goes into the outbox in this same transaction, so
+    // it commits iff the position does.
+    outbox::emit(&mut **tx, &DomainEvent::position_opened(&position))
+        .await
+        .map_err(|e| db_error("emit position_opened event", e))?;
+
     Ok(position)
 }
 
@@ -385,6 +392,10 @@ pub(crate) async fn close_position_in_tx(
     apply_position_closed(&mut **tx, &closed)
         .await
         .map_err(|e| db_error("update position read models after close", e))?;
+
+    outbox::emit(&mut **tx, &DomainEvent::position_closed(&closed))
+        .await
+        .map_err(|e| db_error("emit position_closed event", e))?;
 
     Ok(closed)
 }

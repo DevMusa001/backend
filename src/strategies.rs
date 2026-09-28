@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::auth::AuthUser;
 use crate::error::{db_error, AppError, AppJson};
 use crate::models::Position;
+use crate::outbox::{self, DomainEvent, StrategyExecutedPayload, EVENT_VERSION};
 use crate::positions::{
     close_position_in_tx, current_bs_result, open_position_in_tx, OpenPositionRequest,
 };
@@ -49,6 +50,28 @@ pub async fn execute_strategy(
             open_position_in_tx(&mut tx, &state, &wallet_address, leg, Some(&strategy_id)).await?;
         opened.push(position);
     }
+
+    // One StrategyExecuted event for the whole multi-leg execution, in the
+    // same transaction as the legs themselves.
+    outbox::emit(
+        &mut tx,
+        &DomainEvent::StrategyExecuted(StrategyExecutedPayload {
+            version: EVENT_VERSION,
+            strategy_id: strategy_id.clone(),
+            wallet_address: wallet_address.to_string(),
+            underlying: opened
+                .first()
+                .map(|p| p.underlying.clone())
+                .unwrap_or_default(),
+            leg_ids: opened.iter().map(|p| p.id.clone()).collect(),
+            opened_at: opened
+                .first()
+                .map(|p| p.opened_at.clone())
+                .unwrap_or_default(),
+        }),
+    )
+    .await
+    .map_err(|e| db_error("emit strategy_executed event", e))?;
 
     tx.commit()
         .await

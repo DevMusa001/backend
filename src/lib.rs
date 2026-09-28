@@ -19,6 +19,7 @@ pub mod db;
 pub mod error;
 pub mod history;
 pub mod models;
+pub mod outbox;
 pub mod payoff;
 pub mod positions;
 pub mod prices;
@@ -530,6 +531,7 @@ pub async fn init_state() -> AppState {
     tokio::spawn(alerts::check_alerts_loop(state.clone()));
     tokio::spawn(prices::price_simulator_loop(state.clone()));
     tokio::spawn(readmodels::check_consistency_loop(state.db.clone()));
+    tokio::spawn(outbox::relay_loop(state.db.clone()));
     state
 }
 
