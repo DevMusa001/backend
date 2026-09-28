@@ -24,7 +24,7 @@ fn random_token_hex(len_bytes: usize) -> String {
 /// tiny hand-rolled RFC3339 formatter (UTC only, which is all we need).
 /// Values only ever get compared as strings against each other, so the
 /// exact format just needs to sort the same way ISO 8601 does.
-fn format_unix_secs(total_secs: i64) -> String {
+pub(crate) fn format_unix_secs(total_secs: i64) -> String {
     // Civil-from-days algorithm (Howard Hinnant's public-domain date
     // algorithms) to avoid a chrono dependency for one timestamp format.
     let days = total_secs.div_euclid(86400);

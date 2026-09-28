@@ -2,10 +2,108 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
 use rand::Rng;
+use serde::Serialize;
+use std::collections::HashMap;
 
 use crate::AppState;
 
 const MAX_PCT_MOVE_PER_TICK: f64 = 0.003; // +/-0.3%
+
+/// One minute's OHLC for a single underlying. Accumulated in memory from
+/// simulator ticks and flushed to the `price_candles` table by
+/// [`flush_candles`] once the minute rolls over — that table is the
+/// persisted price history the analytics export's `price_candles` dataset
+/// reads.
+#[derive(Debug, Clone, Serialize)]
+pub struct Candle {
+    pub underlying: String,
+    pub minute: String, // ISO timestamp of the minute bucket
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
+/// The current minute bucket as an ISO timestamp, e.g.
+/// "2026-09-28T12:34:00.000Z". Candle minutes are compared as strings,
+/// which sorts correctly for ISO 8601.
+fn current_minute_bucket() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    crate::auth::format_unix_secs(now - (now % 60))
+}
+
+/// Folds a post-tick price snapshot into the in-memory candles: starts a
+/// new candle when the minute rolls over, otherwise extends the current
+/// one's high/low/close.
+fn update_candles(state: &AppState, prices: &HashMap<String, f64>) {
+    let minute = current_minute_bucket();
+    let mut candles = state.candles.lock().unwrap();
+    for (underlying, &price) in prices {
+        let need_new = match candles.get(underlying) {
+            Some(c) => c.minute != minute,
+            None => true,
+        };
+        if need_new {
+            candles.insert(
+                underlying.clone(),
+                Candle {
+                    underlying: underlying.clone(),
+                    minute: minute.clone(),
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                },
+            );
+        } else {
+            let c = candles.get_mut(underlying).expect("checked above");
+            c.high = c.high.max(price);
+            c.low = c.low.min(price);
+            c.close = price;
+        }
+    }
+}
+
+/// Writes every completed (pre-current-minute) candle to the database.
+/// Called once a minute by the simulator loop. A candle whose insert
+/// fails is logged and skipped; it stays out of the table but the
+/// in-memory copy is already gone, so the next tick starts a fresh one —
+/// acceptable for a paper-trading price feed, and the export's watermark
+/// simply never advances past a minute that failed to persist.
+async fn flush_candles(state: &AppState) {
+    let current_minute = current_minute_bucket();
+    let completed: Vec<Candle> = {
+        let mut candles = state.candles.lock().unwrap();
+        let mut done = Vec::new();
+        for key in candles.keys().cloned().collect::<Vec<_>>() {
+            if candles.get(&key).expect("just iterated").minute < current_minute {
+                done.push(candles.remove(&key).expect("just checked"));
+            }
+        }
+        done
+    };
+
+    for c in completed {
+        let result = sqlx::query(
+            "INSERT OR REPLACE INTO price_candles (underlying, minute, open, high, low, close)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&c.underlying)
+        .bind(&c.minute)
+        .bind(c.open)
+        .bind(c.high)
+        .bind(c.low)
+        .bind(c.close)
+        .execute(&state.db)
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, underlying = %c.underlying, "failed to persist price candle");
+        }
+    }
+}
 
 /// Nudges every spot price by a small random percentage and broadcasts the
 /// new snapshot on `state.spot_tx`, returning the JSON payload sent (or
@@ -23,6 +121,7 @@ pub fn tick_once(state: &AppState) -> String {
         }
         prices.clone()
     };
+    update_candles(state, &prices);
     let vols = state.vol_surface.lock().unwrap().clone();
 
     let payload = serde_json::json!({ "prices": prices, "vols": vols }).to_string();
@@ -35,10 +134,13 @@ pub fn tick_once(state: &AppState) -> String {
 /// live to show instead of the static values AppState::new() seeds at
 /// startup.
 pub async fn price_simulator_loop(state: AppState) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
-        interval.tick().await;
-        tick_once(&state);
+        tokio::select! {
+            _ = tick_interval.tick() => tick_once(&state),
+            _ = flush_interval.tick() => flush_candles(&state).await,
+        }
     }
 }
 

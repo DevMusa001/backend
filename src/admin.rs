@@ -4,6 +4,7 @@
 //! Subcommands:
 //!   zenith-admin readmodels rebuild   Rebuild the CQRS read models from source
 //!   zenith-admin readmodels check     Report read-model drift without fixing it
+//!   zenith-admin export run           Run one analytics export to Parquet
 
 use std::env;
 
@@ -19,7 +20,7 @@ async fn main() {
     zenith_backend::init_tracing();
 
     let args: Vec<String> = env::args().skip(1).collect();
-    let usage = "usage: zenith-admin readmodels <rebuild|check>";
+    let usage = "usage: zenith-admin <readmodels|export> <subcommand> [args]";
 
     let Some((command, rest)) = args.split_first() else {
         eprintln!("{usage}");
@@ -50,7 +51,25 @@ async fn main() {
                 }
             }
             _ => {
-                eprintln!("{usage}");
+                eprintln!("usage: zenith-admin readmodels <rebuild|check>");
+                std::process::exit(2);
+            }
+        },
+        "export" => match rest.first().map(String::as_str) {
+            Some("run") => {
+                let db = open_db().await;
+                let config = zenith_backend::export::ExportConfig::from_env();
+                let manifest = zenith_backend::export::run_export(&db, &config)
+                    .await
+                    .expect("export run failed");
+                println!(
+                    "export run {} finished: {} datasets",
+                    manifest.run_id,
+                    manifest.datasets.len()
+                );
+            }
+            _ => {
+                eprintln!("usage: zenith-admin export run");
                 std::process::exit(2);
             }
         },

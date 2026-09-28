@@ -17,6 +17,7 @@ pub mod auth;
 pub mod collateral;
 pub mod db;
 pub mod error;
+pub mod export;
 pub mod history;
 pub mod models;
 pub mod outbox;
@@ -239,6 +240,11 @@ pub struct AppState {
     /// expected and ignored — the simulator runs regardless of whether
     /// anyone's listening.
     pub spot_tx: tokio::sync::broadcast::Sender<String>,
+    /// The current minute's OHLC candle per underlying, accumulated from
+    /// simulator ticks and flushed to the price_candles table once a
+    /// minute by the simulator loop. This is the persisted price history
+    /// the analytics export's price_candles dataset reads.
+    pub candles: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::prices::Candle>>>,
 }
 
 impl AppState {
@@ -262,6 +268,7 @@ impl AppState {
             vol_surface: Arc::new(std::sync::Mutex::new(vols)),
             db,
             spot_tx,
+            candles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }

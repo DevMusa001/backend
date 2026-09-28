@@ -27,6 +27,9 @@ data-encoding = "2"
 rand = "0.8"
 tower_governor = "0.4"
 async-trait = "0.1"
+sha2 = "0.10"
+arrow = "53"
+parquet = "53"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

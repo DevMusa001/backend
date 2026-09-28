@@ -223,8 +223,9 @@ pub(crate) async fn open_position_in_tx(
     sqlx::query(
         "INSERT INTO positions
             (id, wallet_address, underlying, strike, expiry_days, option_type,
-             position_type, contracts, entry_premium, entry_spot, collateral, status, strategy_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+             position_type, contracts, entry_premium, entry_spot, collateral, status, strategy_id,
+             updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
     )
     .bind(&id)
     .bind(wallet_address)
@@ -370,7 +371,8 @@ pub(crate) async fn close_position_in_tx(
     sqlx::query(
         "UPDATE positions
             SET status = 'closed', close_premium = ?, close_spot = ?, realized_pnl = ?,
-                closed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                closed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE id = ?",
     )
     .bind(close_premium)
@@ -448,7 +450,7 @@ pub async fn roll_position(
     // close_position_in_tx always marks the row 'closed'; a roll is
     // specifically a close-and-reopen, so relabel it 'rolled' to keep
     // /api/v1/history's ledger distinguishable from a plain close.
-    sqlx::query("UPDATE positions SET status = 'rolled' WHERE id = ?")
+    sqlx::query("UPDATE positions SET status = 'rolled', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
         .bind(&closed.id)
         .execute(&mut *tx)
         .await
