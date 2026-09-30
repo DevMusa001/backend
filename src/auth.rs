@@ -72,13 +72,15 @@ pub async fn post_nonce(
     let message = format!("Sign in to Zenith\nNonce: {nonce}");
     let expires_at = format_unix_secs(now_unix() + NONCE_TTL_SECS);
 
-    sqlx::query("INSERT INTO auth_nonces (nonce, wallet_address, expires_at) VALUES (?, ?, ?)")
-        .bind(&message)
-        .bind(&req.wallet_address)
-        .bind(&expires_at)
-        .execute(&state.db)
-        .await
-        .map_err(|e| db_error("store auth nonce", e))?;
+    sqlx::query!(
+        "INSERT INTO auth_nonces (nonce, wallet_address, expires_at) VALUES (?, ?, ?)",
+        &message,
+        &req.wallet_address,
+        &expires_at
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| db_error("store auth nonce", e))?;
 
     Ok(Json(NonceResponse { nonce, message }))
 }
@@ -167,15 +169,16 @@ pub async fn post_verify(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AppJson(req): AppJson<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, AppError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT expires_at FROM auth_nonces WHERE nonce = ? AND wallet_address = ?")
-            .bind(&req.message)
-            .bind(&req.wallet_address)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| db_error("look up auth nonce", e))?;
+    let expires_at: Option<String> = sqlx::query_scalar!(
+        "SELECT expires_at FROM auth_nonces WHERE nonce = ? AND wallet_address = ?",
+        &req.message,
+        &req.wallet_address
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| db_error("look up auth nonce", e))?;
 
-    let (expires_at,) = row.ok_or_else(|| {
+    let expires_at = expires_at.ok_or_else(|| {
         AppError::new(
             StatusCode::UNAUTHORIZED,
             "unknown or already-consumed nonce",
@@ -187,8 +190,7 @@ pub async fn post_verify(
 
     // Single-use: consume the nonce regardless of whether the signature
     // below checks out, so a leaked signature can't be replayed either.
-    sqlx::query("DELETE FROM auth_nonces WHERE nonce = ?")
-        .bind(&req.message)
+    sqlx::query!("DELETE FROM auth_nonces WHERE nonce = ?", &req.message)
         .execute(&state.db)
         .await
         .map_err(|e| db_error("consume auth nonce", e))?;
@@ -251,23 +253,25 @@ pub async fn post_verify(
         ));
     }
 
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO accounts (wallet_address) VALUES (?) ON CONFLICT(wallet_address) DO NOTHING",
+        &req.wallet_address
     )
-    .bind(&req.wallet_address)
     .execute(&state.db)
     .await
     .map_err(|e| db_error("create or confirm account", e))?;
 
     let token = random_token_hex(32);
     let session_expires_at = format_unix_secs(now_unix() + SESSION_TTL_SECS);
-    sqlx::query("INSERT INTO sessions (token, wallet_address, expires_at) VALUES (?, ?, ?)")
-        .bind(&token)
-        .bind(&req.wallet_address)
-        .bind(&session_expires_at)
-        .execute(&state.db)
-        .await
-        .map_err(|e| db_error("create session", e))?;
+    sqlx::query!(
+        "INSERT INTO sessions (token, wallet_address, expires_at) VALUES (?, ?, ?)",
+        &token,
+        &req.wallet_address,
+        &session_expires_at
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| db_error("create session", e))?;
 
     // Capture the session IP at verify time so the competition service can
     // run sybil heuristics over wallets that share session IPs. Best-effort:
@@ -314,14 +318,16 @@ impl FromRequestParts<AppState> for AuthUser {
 
         let token = header.strip_prefix("Bearer ").ok_or_else(unauthorized)?;
 
-        let row: Option<(String, String)> =
-            sqlx::query_as("SELECT wallet_address, expires_at FROM sessions WHERE token = ?")
-                .bind(token)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| db_error("look up session", e))?;
+        let row = sqlx::query_as!(
+            "SELECT wallet_address, expires_at FROM sessions WHERE token = ?",
+            token
+        )
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| db_error("look up session", e))?;
 
-        let (wallet_address, expires_at) = row.ok_or_else(unauthorized)?;
+        let (wallet_address, expires_at) =
+            row.map(|r| (r.wallet_address, r.expires_at)).ok_or_else(unauthorized)?;
         if expires_at.as_str() < format_unix_secs(now_unix()).as_str() {
             return Err(AppError::new(StatusCode::UNAUTHORIZED, "session expired"));
         }
@@ -333,3 +339,214 @@ impl FromRequestParts<AppState> for AuthUser {
 pub async fn get_me(auth: AuthUser) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "wallet_address": auth.0 }))
 }
+
+/// Deletes every expired nonce/session row as of now. Returns
+/// (expired_nonces, expired_sessions) removed, or an sqlx error from
+/// whichever DELETE ran into one — pulled out of the loop below so it has
+/// a return value the loop can log and tests can assert on directly,
+/// instead of only being observable through log lines or side effects on
+/// a live timer.
+pub async fn sweep_expired(db: &sqlx::SqlitePool) -> Result<(u64, u64), sqlx::Error> {
+    let now = format_unix_secs(now_unix());
+
+    let nonces = sqlx::query!("DELETE FROM auth_nonces WHERE expires_at < ?", &now)
+        .execute(db)
+        .await?;
+    let sessions = sqlx::query!("DELETE FROM sessions WHERE expires_at < ?", &now)
+        .execute(db)
+        .await?;
+
+    Ok((nonces.rows_affected(), sessions.rows_affected()))
+}
+
+/// Sweeps expired nonces and sessions every 5 minutes. Neither table is
+/// large or hot enough to need anything fancier than a periodic DELETE;
+/// this just keeps them from growing forever.
+pub async fn cleanup_expired_loop(db: sqlx::SqlitePool) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+    loop {
+        interval.tick().await;
+
+        match sweep_expired(&db).await {
+            Ok((n, s)) if n > 0 || s > 0 => {
+                tracing::info!(
+                    expired_nonces = n,
+                    expired_sessions = s,
+                    "swept expired auth rows"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "auth cleanup sweep failed");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> (sqlx::SqlitePool, std::path::PathBuf) {
+        let db_path =
+            std::env::temp_dir().join(format!("zenith-auth-test-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(&format!("sqlite://{}", db_path.display())).await;
+        (pool, db_path)
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_removes_only_expired_rows() {
+        let (db, db_path) = test_db().await;
+
+        let past = format_unix_secs(now_unix() - 3600);
+        let future = format_unix_secs(now_unix() + 3600);
+
+        sqlx::query(
+            "INSERT INTO auth_nonces (nonce, wallet_address, expires_at) VALUES (?, 'GTEST', ?)",
+        )
+        .bind("expired-nonce")
+        .bind(&past)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auth_nonces (nonce, wallet_address, expires_at) VALUES (?, 'GTEST', ?)",
+        )
+        .bind("live-nonce")
+        .bind(&future)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO accounts (wallet_address) VALUES ('GTEST')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (token, wallet_address, expires_at) VALUES (?, 'GTEST', ?)",
+        )
+        .bind("expired-session")
+        .bind(&past)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (token, wallet_address, expires_at) VALUES (?, 'GTEST', ?)",
+        )
+        .bind("live-session")
+        .bind(&future)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let (expired_nonces, expired_sessions) = sweep_expired(&db).await.unwrap();
+        assert_eq!(expired_nonces, 1);
+        assert_eq!(expired_sessions, 1);
+
+        let remaining_nonces: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_nonces")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let remaining_sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(remaining_nonces, 1);
+        assert_eq!(remaining_sessions, 1);
+
+        db.close().await;
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn sweep_expired_is_a_no_op_when_nothing_has_expired() {
+        let (db, db_path) = test_db().await;
+
+        let future = format_unix_secs(now_unix() + 3600);
+        sqlx::query("INSERT INTO auth_nonces (nonce, wallet_address, expires_at) VALUES ('live', 'GTEST', ?)")
+            .bind(&future)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let (expired_nonces, expired_sessions) = sweep_expired(&db).await.unwrap();
+        assert_eq!(expired_nonces, 0);
+        assert_eq!(expired_sessions, 0);
+
+        db.close().await;
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Not reachable through the integration test harness at all — the
+    /// real SESSION_TTL_SECS is 24 hours and nothing in this app lets a
+    /// caller fast-forward the system clock, so the only way to actually
+    /// exercise this specific rejection (found, but expired — distinct
+    /// from "garbage/unknown token" in tests/auth_test.rs) is to insert an
+    /// already-expired session directly and call the extractor as a plain
+    /// function, bypassing the router entirely.
+    #[tokio::test]
+    async fn auth_user_rejects_a_session_that_has_expired() {
+        let (db, db_path) = test_db().await;
+        let state = crate::AppState::new(db);
+
+        sqlx::query("INSERT INTO accounts (wallet_address) VALUES ('GTEST')")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let past = format_unix_secs(now_unix() - 3600);
+        sqlx::query("INSERT INTO sessions (token, wallet_address, expires_at) VALUES ('tok123', 'GTEST', ?)")
+            .bind(&past)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let req = axum::http::Request::builder()
+            .header("authorization", "Bearer tok123")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+
+        let result = AuthUser::from_request_parts(&mut parts, &state).await;
+        let err = result.expect_err("an expired session must not authenticate");
+        assert_eq!(err.message, "session expired");
+
+        state.db.close().await;
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Same situation as the expired-session test above: NONCE_TTL_SECS is
+    /// a real 5 minutes, nothing lets a test fast-forward the clock, so
+    /// this inserts an already-expired nonce directly and calls
+    /// post_verify as a plain function. The nonce-expiry check runs
+    /// before any signature verification, so a throwaway signature that
+    /// was never going to be checked is fine here.
+    #[tokio::test]
+    async fn post_verify_rejects_an_expired_nonce() {
+        let (db, db_path) = test_db().await;
+        let state = crate::AppState::new(db);
+
+        let message = "Sign in to Zenith\nNonce: deadbeef";
+        let past = format_unix_secs(now_unix() - 3600);
+        sqlx::query(
+            "INSERT INTO auth_nonces (nonce, wallet_address, expires_at) VALUES (?, 'GTEST', ?)",
+        )
+        .bind(message)
+        .bind(&past)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let req = VerifyRequest {
+            wallet_address: "GTEST".to_string(),
+            message: message.to_string(),
+            signature: "AA==".to_string(),
+        };
+        let result = post_verify(State(state.clone()), AppJson(req)).await;
+        let err = result.expect_err("an expired nonce must be rejected");
+        assert_eq!(err.message, "nonce expired");
+
+        state.db.close().await;
+        let _ = std::fs::remove_file(&db_path);
+    }
+}
+

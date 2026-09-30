@@ -27,6 +27,24 @@ jobs:
       - name: Verify generated contract bindings are up to date
         run: cargo xtask codegen --check
 
+  sqlx-prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # sqlx-cli must match the sqlx version in Cargo.toml (0.8.x) so the
+      # offline metadata it generates is byte-identical to what the macros
+      # committed in .sqlx/ were built against.
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version "^0.8"
+      # The macros describe their queries live against a real database, so
+      # prepare needs a freshly migrated one to check against.
+      - name: Create a freshly migrated database
+        run: DATABASE_URL=sqlite://ci-prepare.db sqlx migrate run
+      - name: Check offline query metadata is up to date
+        run: DATABASE_URL=sqlite://ci-prepare.db cargo sqlx prepare --check
+
   clippy:
     runs-on: ubuntu-latest
     steps:

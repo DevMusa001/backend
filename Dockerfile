@@ -2,6 +2,11 @@
 FROM rust:1-slim AS builder
 WORKDIR /app
 
+# The query macros resolve their metadata from the committed .sqlx/ directory
+# at compile time; SQLX_OFFLINE=true keeps `cargo build` from trying to open a
+# database connection during the build (there is none in this stage).
+ENV SQLX_OFFLINE=true
+
 # sqlx's "sqlite" feature builds SQLite from source via libsqlite3-sys,
 # which needs a C compiler — the slim image doesn't ship one by default.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
