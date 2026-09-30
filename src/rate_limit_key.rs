@@ -40,3 +40,33 @@ impl KeyExtractor for BearerOrIpKeyExtractor {
             .ok_or(GovernorError::UnableToExtractKey)
     }
 }
+
+/// Extracts the caller's IP for WebSocket connection accounting, reusing the
+/// same trusted-proxy logic as the rate limiter: when the request carries a
+/// `ConnectInfo<SocketAddr>` (populated by `into_make_service_with_connect_info`
+/// behind a trusted proxy) we key on the peer address, otherwise we fall back
+/// to the `x-forwarded-for` / `x-real-ip` headers so per-IP connection caps
+/// still work when the server sits behind a reverse proxy.
+///
+/// Returns `None` only when no address can be determined at all, in which case
+/// callers should treat the connection as unkeyed rather than rejecting it.
+pub fn extract_client_ip<T>(req: &Request<T>) -> Option<std::net::IpAddr> {
+    if let Some(addr) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return Some(addr.0.ip());
+    }
+
+    if let Some(ip) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+    {
+        return Some(ip);
+    }
+
+    req.headers()
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+}

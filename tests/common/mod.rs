@@ -9,6 +9,8 @@
 //! view even though it's exercised by others.
 #![allow(dead_code)]
 
+pub mod perf;
+
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};

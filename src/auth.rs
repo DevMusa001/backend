@@ -1,10 +1,11 @@
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::{request::Parts, StatusCode};
 use axum::response::Json;
 use data_encoding::BASE64;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::error::{db_error, AppError, AppJson};
 use crate::AppState;
@@ -71,13 +72,15 @@ pub async fn post_nonce(
     let message = format!("Sign in to Zenith\nNonce: {nonce}");
     let expires_at = format_unix_secs(now_unix() + NONCE_TTL_SECS);
 
-    sqlx::query("INSERT INTO auth_nonces (nonce, wallet_address, expires_at) VALUES (?, ?, ?)")
-        .bind(&message)
-        .bind(&req.wallet_address)
-        .bind(&expires_at)
-        .execute(&state.db)
-        .await
-        .map_err(|e| db_error("store auth nonce", e))?;
+    sqlx::query!(
+        "INSERT INTO auth_nonces (nonce, wallet_address, expires_at) VALUES (?, ?, ?)",
+        &message,
+        &req.wallet_address,
+        &expires_at
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| db_error("store auth nonce", e))?;
 
     Ok(Json(NonceResponse { nonce, message }))
 }
@@ -89,11 +92,70 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
+pub struct SignerSignature {
+    pub public_key: String,
+    pub signature: String, // base64-encoded
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AccountSigner {
+    pub key: String,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AccountThresholds {
+    pub low_threshold: u32,
+    pub med_threshold: u32,
+    pub high_threshold: u32,
+}
+
+impl Default for AccountThresholds {
+    fn default() -> Self {
+        Self {
+            low_threshold: 1,
+            med_threshold: 1,
+            high_threshold: 1,
+        }
+    }
+}
+
+/// Evaluates if the verified distinct signatures meet the required weight threshold.
+/// Master keys with 0 weight are explicitly ignored. Duplicate signatures are only counted once.
+pub fn meets_threshold(
+    signers: &[AccountSigner],
+    threshold: u32,
+    valid_signatures: &[SignerSignature],
+) -> bool {
+    if threshold == 0 {
+        return true;
+    }
+
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut total_weight: u32 = 0;
+
+    for sig in valid_signatures {
+        if !seen_keys.insert(&sig.public_key) {
+            continue; // Ignore duplicate signatures from same signer
+        }
+
+        if let Some(signer) = signers.iter().find(|s| s.key == sig.public_key) {
+            if signer.weight > 0 {
+                total_weight = total_weight.saturating_add(signer.weight);
+            }
+        }
+    }
+
+    total_weight >= threshold
+}
+
 #[derive(Deserialize)]
 pub struct VerifyRequest {
     pub wallet_address: String,
     pub message: String,
-    pub signature: String, // base64-encoded 64-byte ed25519 signature
+    pub signature: Option<String>, // base64-encoded 64-byte ed25519 signature (backward-compatible)
+    pub signatures: Option<Vec<SignerSignature>>, // multi-signature support
 }
 
 #[derive(Debug, Serialize)]
@@ -104,17 +166,19 @@ pub struct VerifyResponse {
 
 pub async fn post_verify(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AppJson(req): AppJson<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, AppError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT expires_at FROM auth_nonces WHERE nonce = ? AND wallet_address = ?")
-            .bind(&req.message)
-            .bind(&req.wallet_address)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| db_error("look up auth nonce", e))?;
+    let expires_at: Option<String> = sqlx::query_scalar!(
+        "SELECT expires_at FROM auth_nonces WHERE nonce = ? AND wallet_address = ?",
+        &req.message,
+        &req.wallet_address
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| db_error("look up auth nonce", e))?;
 
-    let (expires_at,) = row.ok_or_else(|| {
+    let expires_at = expires_at.ok_or_else(|| {
         AppError::new(
             StatusCode::UNAUTHORIZED,
             "unknown or already-consumed nonce",
@@ -126,63 +190,102 @@ pub async fn post_verify(
 
     // Single-use: consume the nonce regardless of whether the signature
     // below checks out, so a leaked signature can't be replayed either.
-    sqlx::query("DELETE FROM auth_nonces WHERE nonce = ?")
-        .bind(&req.message)
+    sqlx::query!("DELETE FROM auth_nonces WHERE nonce = ?", &req.message)
         .execute(&state.db)
         .await
         .map_err(|e| db_error("consume auth nonce", e))?;
 
-    let pubkey_bytes =
-        crate::strkey::decode_stellar_public_key(&req.wallet_address).map_err(|_| {
-            AppError::new(
-                StatusCode::BAD_REQUEST,
-                "wallet_address is not a valid Stellar G... address",
-            )
-        })?;
-    let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| {
-        AppError::new(
+    // Collect signatures to verify
+    let mut sig_list: Vec<SignerSignature> = req.signatures.clone().unwrap_or_default();
+    if let Some(single_sig) = &req.signature {
+        if sig_list.is_empty() {
+            sig_list.push(SignerSignature {
+                public_key: req.wallet_address.clone(),
+                signature: single_sig.clone(),
+            });
+        }
+    }
+
+    if sig_list.is_empty() {
+        return Err(AppError::new(
             StatusCode::BAD_REQUEST,
-            "wallet_address decodes to an invalid ed25519 key",
-        )
-    })?;
+            "at least one signature is required",
+        ));
+    }
 
-    let sig_bytes = BASE64
-        .decode(req.signature.as_bytes())
-        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "signature is not valid base64"))?;
-    let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-        AppError::new(
-            StatusCode::BAD_REQUEST,
-            "signature must be exactly 64 bytes",
-        )
-    })?;
-    let signature = Signature::from_bytes(&sig_array);
+    let mut valid_signatures = Vec::new();
 
-    verifying_key
-        .verify_strict(req.message.as_bytes(), &signature)
-        .map_err(|_| {
-            AppError::new(
-                StatusCode::UNAUTHORIZED,
-                "signature does not verify against wallet_address for this message",
-            )
-        })?;
+    for sig_item in &sig_list {
+        let pubkey_bytes = match crate::strkey::decode_stellar_public_key(&sig_item.public_key) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let verifying_key = match VerifyingKey::from_bytes(&pubkey_bytes) {
+            Ok(vk) => vk,
+            Err(_) => continue,
+        };
+        let sig_bytes = match BASE64.decode(sig_item.signature.as_bytes()) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let sig_array: [u8; 64] = match sig_bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => continue,
+        };
+        let signature = Signature::from_bytes(&sig_array);
 
-    sqlx::query(
+        if verifying_key.verify_strict(req.message.as_bytes(), &signature).is_ok() {
+            valid_signatures.push(sig_item.clone());
+        }
+    }
+
+    // Default signer configuration for single-sig or fallback account
+    let default_signers = vec![AccountSigner {
+        key: req.wallet_address.clone(),
+        weight: 1,
+    }];
+    let threshold = 1;
+
+    if !meets_threshold(&default_signers, threshold, &valid_signatures) {
+        return Err(AppError::new(
+            StatusCode::UNAUTHORIZED,
+            "signatures do not meet the required threshold for this wallet",
+        ));
+    }
+
+    sqlx::query!(
         "INSERT INTO accounts (wallet_address) VALUES (?) ON CONFLICT(wallet_address) DO NOTHING",
+        &req.wallet_address
     )
-    .bind(&req.wallet_address)
     .execute(&state.db)
     .await
     .map_err(|e| db_error("create or confirm account", e))?;
 
     let token = random_token_hex(32);
     let session_expires_at = format_unix_secs(now_unix() + SESSION_TTL_SECS);
-    sqlx::query("INSERT INTO sessions (token, wallet_address, expires_at) VALUES (?, ?, ?)")
-        .bind(&token)
-        .bind(&req.wallet_address)
-        .bind(&session_expires_at)
-        .execute(&state.db)
-        .await
-        .map_err(|e| db_error("create session", e))?;
+    sqlx::query!(
+        "INSERT INTO sessions (token, wallet_address, expires_at) VALUES (?, ?, ?)",
+        &token,
+        &req.wallet_address,
+        &session_expires_at
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| db_error("create session", e))?;
+
+    // Capture the session IP at verify time so the competition service can
+    // run sybil heuristics over wallets that share session IPs. Best-effort:
+    // a failure to record the IP must not block a valid login.
+    let ip = addr.ip().to_string();
+    let _ = sqlx::query(
+        "INSERT INTO session_ips (wallet_address, ip, session_token, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&req.wallet_address)
+    .bind(&ip)
+    .bind(&token)
+    .bind(format_unix_secs(now_unix()))
+    .execute(&state.db)
+    .await;
 
     Ok(Json(VerifyResponse {
         token,
@@ -215,14 +318,16 @@ impl FromRequestParts<AppState> for AuthUser {
 
         let token = header.strip_prefix("Bearer ").ok_or_else(unauthorized)?;
 
-        let row: Option<(String, String)> =
-            sqlx::query_as("SELECT wallet_address, expires_at FROM sessions WHERE token = ?")
-                .bind(token)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| db_error("look up session", e))?;
+        let row = sqlx::query_as!(
+            "SELECT wallet_address, expires_at FROM sessions WHERE token = ?",
+            token
+        )
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| db_error("look up session", e))?;
 
-        let (wallet_address, expires_at) = row.ok_or_else(unauthorized)?;
+        let (wallet_address, expires_at) =
+            row.map(|r| (r.wallet_address, r.expires_at)).ok_or_else(unauthorized)?;
         if expires_at.as_str() < format_unix_secs(now_unix()).as_str() {
             return Err(AppError::new(StatusCode::UNAUTHORIZED, "session expired"));
         }
@@ -244,12 +349,10 @@ pub async fn get_me(auth: AuthUser) -> Json<serde_json::Value> {
 pub async fn sweep_expired(db: &sqlx::SqlitePool) -> Result<(u64, u64), sqlx::Error> {
     let now = format_unix_secs(now_unix());
 
-    let nonces = sqlx::query("DELETE FROM auth_nonces WHERE expires_at < ?")
-        .bind(&now)
+    let nonces = sqlx::query!("DELETE FROM auth_nonces WHERE expires_at < ?", &now)
         .execute(db)
         .await?;
-    let sessions = sqlx::query("DELETE FROM sessions WHERE expires_at < ?")
-        .bind(&now)
+    let sessions = sqlx::query!("DELETE FROM sessions WHERE expires_at < ?", &now)
         .execute(db)
         .await?;
 
@@ -446,3 +549,4 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 }
+

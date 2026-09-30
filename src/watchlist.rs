@@ -12,12 +12,15 @@ pub async fn get_watchlist(
     State(state): State<AppState>,
     AuthUser(wallet_address): AuthUser,
 ) -> Result<Json<Vec<WatchlistItem>>, AppError> {
-    let items: Vec<WatchlistItem> =
-        sqlx::query_as("SELECT * FROM watchlist WHERE wallet_address = ? ORDER BY added_at DESC")
-            .bind(&wallet_address)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| db_error("load watchlist", e))?;
+    // `wallet_address!`/`underlying!` override the composite-PK nullable quirk.
+    let items: Vec<WatchlistItem> = sqlx::query_as!(
+        WatchlistItem,
+        "SELECT wallet_address AS \"wallet_address!\", underlying AS \"underlying!\", added_at FROM watchlist WHERE wallet_address = ? ORDER BY added_at DESC",
+        &wallet_address
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_error("load watchlist", e))?;
 
     Ok(Json(items))
 }
@@ -44,12 +47,11 @@ pub async fn add_watchlist(
         ));
     }
 
-    sqlx::query(
-        "INSERT INTO watchlist (wallet_address, underlying) VALUES (?, ?)
-         ON CONFLICT(wallet_address, underlying) DO NOTHING",
+    sqlx::query!(
+        "INSERT INTO watchlist (wallet_address, underlying) VALUES (?, ?) ON CONFLICT(wallet_address, underlying) DO NOTHING",
+        &wallet_address,
+        &req.underlying
     )
-    .bind(&wallet_address)
-    .bind(&req.underlying)
     .execute(&state.db)
     .await
     .map_err(|e| db_error("add watchlist item", e))?;
@@ -62,12 +64,14 @@ pub async fn remove_watchlist(
     AuthUser(wallet_address): AuthUser,
     Path(underlying): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let result = sqlx::query("DELETE FROM watchlist WHERE wallet_address = ? AND underlying = ?")
-        .bind(&wallet_address)
-        .bind(&underlying)
-        .execute(&state.db)
-        .await
-        .map_err(|e| db_error("remove watchlist item", e))?;
+    let result = sqlx::query!(
+        "DELETE FROM watchlist WHERE wallet_address = ? AND underlying = ?",
+        &wallet_address,
+        &underlying
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| db_error("remove watchlist item", e))?;
 
     if result.rows_affected() == 0 {
         return Err(AppError::new(

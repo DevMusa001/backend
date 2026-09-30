@@ -1,55 +1,69 @@
-# Zenith Backend
+# Options Pricing API
 
-Rust/Axum API for Zenith, a decentralized options protocol on Stellar
-Soroban. Black-Scholes pricing with a crypto vol smile, a paper-trading
-account/positions ledger backed by SQLite, sign-in-with-wallet auth, and
-a live spot-price WebSocket feed.
+A high-performance options pricing and market data API.
 
-## Status
+## API
 
-Market data (spot prices, vol surface) is in-memory and nudged by a
-background simulator — there's no real price feed or on-chain
-integration yet. Everything else (accounts, positions, watchlist,
-alerts) persists to a SQLite file via sqlx. This is a paper-trading
-backend for the frontend to build against, not a production trading
-system.
+### REST
 
-## Getting started
+- `GET /api/v1/spot` — current spot prices for all underlyings.
+- `GET /api/v1/chain` — option chain for an underlying/expiry.
+- `GET /api/v1/surface` — implied volatility surface for an underlying.
 
-```bash
-cp .env.example .env   # DATABASE_URL=sqlite://zenith.db, or leave unset for the same default
-cargo run
-# listening on 0.0.0.0:8081
+### WebSocket
+
+#### Legacy: `/api/v1/ws/spot`
+
+> **Deprecation note:** `/api/v1/ws/spot` is deprecated in favor of the
+> multiplexed `/api/v1/ws` endpoint below. It continues to work unchanged for
+> backwards compatibility, but new clients should use `/api/v1/ws`.
+
+Pushes every underlying's spot price to every connected client roughly every
+2 seconds, regardless of what the client is interested in.
+
+#### Multiplexed: `/api/v1/ws`
+
+A single connection can subscribe to multiple public channels using a JSON
+subscribe/unsubscribe protocol. Each channel delivers a snapshot followed by
+deltas, with per-channel monotonically increasing sequence numbers so clients
+can detect gaps and resubscribe for a fresh snapshot.
+
+**Client messages**
+
+```json
+{"op": "subscribe", "channels": ["spot.BTC", "chain.BTC.2024-12-27", "surface.BTC"]}
+{"op": "unsubscribe", "channels": ["spot.BTC"]}
 ```
 
-```bash
-cargo test              # 11 unit tests + 29 integration tests
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+**Server messages**
+
+```json
+{"channel": "spot.BTC", "seq": 1, "type": "snapshot", "data": { ... }}
+{"channel": "spot.BTC", "seq": 2, "type": "update", "data": { ... }}
 ```
 
-No external services required — sqlx creates and migrates the SQLite
-file on first run, and every integration test spins up its own
-throwaway temp-file database.
+**Channels**
 
-## Endpoints
+- `spot.<UNDERLYING>` — spot price updates for an underlying.
+- `chain.<UNDERLYING>.<EXPIRY>` — option chain updates for an underlying/expiry.
+- `surface.<UNDERLYING>` — implied volatility surface updates for an underlying.
 
-All `/api/v1/*` endpoints marked **auth** require an
-`Authorization: Bearer <token>` header from `/api/v1/auth/verify`.
+**Behavior**
 
-### Market data (public)
+- Per-channel `seq` is monotonically increasing. A gap indicates missed
+  messages; resubscribe to receive a fresh snapshot.
+- Chain updates are computed lazily and shared across subscribers: a channel is
+  only computed when it has at least one subscriber.
+- A maximum of 50 subscriptions per connection is allowed. Exceeding the limit
+  returns a structured error message rather than disconnecting.
+- Subscribing to an unknown underlying returns an error message, not a
+  disconnect.
+- Duplicate subscriptions are idempotent.
+- Connections that never send a subscribe are closed after a 60s idle timeout.
 
-| Endpoint | What it does |
-|---|---|
-| `GET /health` | Liveness + a DB ping |
-| `GET /api/v1/spot` | Current spot prices + base vols for all underlyings |
-| `GET /api/v1/price` | Black-Scholes premium/Greeks for one option |
-| `GET /api/v1/iv` | Implied vol for a given market price (Newton-Raphson) |
-| `GET /api/v1/chain` | Full option chain (calls+puts) across strikes for one expiry |
-| `GET /api/v1/expiries/:underlying` | Available expiries for an underlying |
-| `GET /api/v1/stats` | Protocol-wide stats (mocked, not derived from real trades) |
-| `GET /api/v1/ws/spot` | WebSocket: snapshot on connect, then a live tick every ~2s |
-| `POST /api/v1/portfolio/payoff` | Combined P&L curve for a set of caller-supplied legs (no auth — legs carry their own premium) |
+**Out of scope:** private/authenticated channels (tracked separately).
+
+See [`docs/ws-protocol.md`](docs/ws-protocol.md) for the full protocol write-up.
 
 ### Auth (public, rate-limited)
 
@@ -68,6 +82,7 @@ requiring a session — see `mutation_rate_limited_routes()` in `lib.rs`.
 | Endpoint | What it does |
 |---|---|
 | `GET /api/v1/account` | Balance + locked collateral |
+| `GET /api/v1/wallet/readiness` | Balance, locked collateral, available buying power and whether the wallet can currently trade (cached per-wallet, invalidated on every trade) |
 | `GET /api/v1/positions` | List positions (`?status=`, `?strategy_id=`, `?limit=`, `?offset=`) |
 | `POST /api/v1/positions/open` | Price and open one position |
 | `POST /api/v1/positions/:id/close` | Settle an open position at current spot/vol |
@@ -124,6 +139,18 @@ tests/
 `zenith_backend` library crate, which is what lets `tests/*_test.rs`
 exercise the real router without a bin-only crate's usual restriction
 (a `tests/` directory can only see a *library* crate's public items).
+
+### A note on the cache
+
+Expensive, shareable computations (option chains, the spot/vol surface,
+expiry calendars, protocol stats) are cached per **market snapshot version** —
+a counter bumped on every price-simulator tick — so a new tick makes the
+previous tick's entries unreachable with no explicit invalidation. Wallet
+readiness is the exception: it is keyed by wallet and invalidated on every
+trade that moves balance/collateral. The backend is moka (in-process, the
+default) or Redis, configured via `ZENITH_CACHE` / `ZENITH_REDIS_URL`; a Redis
+outage degrades to computing on every request rather than erroring. See
+`src/cache.rs` and `docs/sqlx-offline.md`.
 
 ### A note on the pricing model
 

@@ -13,12 +13,16 @@ pub async fn get_alerts(
     State(state): State<AppState>,
     AuthUser(wallet_address): AuthUser,
 ) -> Result<Json<Vec<Alert>>, AppError> {
-    let alerts: Vec<Alert> =
-        sqlx::query_as("SELECT * FROM alerts WHERE wallet_address = ? ORDER BY created_at DESC")
-            .bind(&wallet_address)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| db_error("load alerts", e))?;
+    // `id!` overrides the TEXT-PK nullable quirk; `triggered: bool` overrides
+    // the INTEGER column to decode as the model's bool.
+    let alerts: Vec<Alert> = sqlx::query_as!(
+        Alert,
+        "SELECT id AS \"id!\", wallet_address, underlying, condition, target_price, triggered AS \"triggered: bool\", created_at, triggered_at FROM alerts WHERE wallet_address = ? ORDER BY created_at DESC",
+        &wallet_address
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_error("load alerts", e))?;
 
     Ok(Json(alerts))
 }
@@ -60,24 +64,26 @@ pub async fn create_alert(
     }
 
     let id = uuid::Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO alerts (id, wallet_address, underlying, condition, target_price)
-         VALUES (?, ?, ?, ?, ?)",
+    sqlx::query!(
+        "INSERT INTO alerts (id, wallet_address, underlying, condition, target_price) VALUES (?, ?, ?, ?, ?)",
+        &id,
+        &wallet_address,
+        &req.underlying,
+        &req.condition,
+        req.target_price
     )
-    .bind(&id)
-    .bind(&wallet_address)
-    .bind(&req.underlying)
-    .bind(&req.condition)
-    .bind(req.target_price)
     .execute(&state.db)
     .await
     .map_err(|e| db_error("create alert", e))?;
 
-    let alert: Alert = sqlx::query_as("SELECT * FROM alerts WHERE id = ?")
-        .bind(&id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| db_error("load the alert just created", e))?;
+    let alert: Alert = sqlx::query_as!(
+        Alert,
+        "SELECT id AS \"id!\", wallet_address, underlying, condition, target_price, triggered AS \"triggered: bool\", created_at, triggered_at FROM alerts WHERE id = ?",
+        &id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_error("load the alert just created", e))?;
 
     Ok(Json(alert))
 }
@@ -87,9 +93,7 @@ pub async fn delete_alert(
     AuthUser(wallet_address): AuthUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let result = sqlx::query("DELETE FROM alerts WHERE id = ? AND wallet_address = ?")
-        .bind(&id)
-        .bind(&wallet_address)
+    let result = sqlx::query!("DELETE FROM alerts WHERE id = ? AND wallet_address = ?", &id, &wallet_address)
         .execute(&state.db)
         .await
         .map_err(|e| db_error("delete alert", e))?;

@@ -72,6 +72,59 @@ pub fn net_premium(legs: &[PricedLeg]) -> f64 {
     })
 }
 
+/// Find the spot prices where the combined P&L crosses zero, by
+/// root-finding on `combined_pnl`. Scans a bracket around the strikes
+/// and bisects each sign change, so callers (e.g. the strategy builder)
+/// get breakevens without reimplementing the search.
+pub fn breakevens(legs: &[PricedLeg]) -> Vec<f64> {
+    if legs.is_empty() {
+        return Vec::new();
+    }
+    let min_strike = legs
+        .iter()
+        .map(|l| l.strike)
+        .fold(f64::INFINITY, f64::min);
+    let max_strike = legs
+        .iter()
+        .map(|l| l.strike)
+        .fold(f64::NEG_INFINITY, f64::max);
+    // Bracket wide enough to capture breakevens outside the strike range
+    // (e.g. a short strangle's upside breakeven sits above the call strike).
+    let span = (max_strike - min_strike).max(1.0);
+    let lo = min_strike - span;
+    let hi = max_strike + span;
+    let steps = 2000u32;
+
+    let mut roots = Vec::new();
+    let mut prev_spot = lo;
+    let mut prev_pnl = combined_pnl(legs, lo);
+    for i in 1..=steps {
+        let spot = lo + (hi - lo) * i as f64 / steps as f64;
+        let pnl = combined_pnl(legs, spot);
+        if prev_pnl == 0.0 {
+            roots.push(prev_spot);
+        } else if (prev_pnl < 0.0) != (pnl < 0.0) {
+            // Bisect the sign change for a tight root estimate.
+            let (mut a, mut b) = (prev_spot, spot);
+            let (mut fa, _) = (prev_pnl, pnl);
+            for _ in 0..60 {
+                let mid = 0.5 * (a + b);
+                let fm = combined_pnl(legs, mid);
+                if (fa < 0.0) != (fm < 0.0) {
+                    b = mid;
+                } else {
+                    a = mid;
+                    fa = fm;
+                }
+            }
+            roots.push(0.5 * (a + b));
+        }
+        prev_spot = spot;
+        prev_pnl = pnl;
+    }
+    roots
+}
+
 #[derive(Deserialize)]
 pub struct PayoffRequest {
     pub legs: Vec<PricedLeg>,
@@ -174,5 +227,39 @@ mod tests {
         assert_eq!(series.len(), 5);
         assert_eq!(series.first().unwrap().pnl, combined_pnl(&legs, 80.0));
         assert_eq!(series.last().unwrap().pnl, combined_pnl(&legs, 120.0));
+    }
+
+    #[test]
+    fn breakevens_of_long_straddle_are_strike_plus_minus_premium() {
+        let legs = vec![
+            leg("call", "long", 100.0, 1.0, 5.0),
+            leg("put", "long", 100.0, 1.0, 5.0),
+        ];
+        let mut roots = breakevens(&legs);
+        roots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(roots.len(), 2);
+        assert!((roots[0] - 90.0).abs() < 1e-3);
+        assert!((roots[1] - 110.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn breakevens_of_short_strangle_are_outside_strikes() {
+        let legs = vec![
+            leg("put", "short", 95.0, 1.0, 3.0),
+            leg("call", "short", 105.0, 1.0, 3.0),
+        ];
+        let mut roots = breakevens(&legs);
+        roots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(roots.len(), 2);
+        assert!((roots[0] - 89.0).abs() < 1e-3);
+        assert!((roots[1] - 111.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn breakevens_empty_for_always_profitable_structure() {
+        // A long call bought below intrinsic value is profitable at every
+        // expiry spot, so there is no breakeven.
+        let legs = vec![leg("call", "long", 100.0, 1.0, 0.0)];
+        assert!(breakevens(&legs).is_empty());
     }
 }
